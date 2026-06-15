@@ -1,0 +1,27 @@
+# Virtual environment
+.venv/
+
+# Session storage (contains login tokens)
+session/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backups
+.backup/
+
+# Browser binaries
+browsers/
+
+# Logs
+logs/

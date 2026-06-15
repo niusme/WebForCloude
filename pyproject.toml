@@ -1,0 +1,9 @@
+[project]
+name = "webai"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "html2text>=2025.4.15",
+    "playwright>=1.60.0",
+]
