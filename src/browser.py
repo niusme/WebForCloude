@@ -8,13 +8,18 @@ import os
 import logging
 from typing import Optional
 
+from src.pw_env import (
+    PROJECT_BROWSERS_PATH,
+    apply_playwright_browsers_path,
+    describe_playwright_browsers_path,
+)
+from src.exceptions import DeepSeekError
 from src.timing import _tic, _toc
 
-# Point Playwright to the project-local browser binaries
-_PW_BROWSERS_PATH = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "browsers")
-)
-os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", _PW_BROWSERS_PATH)
+# Prefer project-local browser binaries, but fall back to Playwright's default
+# install when they are missing (otherwise launch dies with "Executable doesn't
+# exist"). Must run before any browser object is launched.
+apply_playwright_browsers_path()
 
 from playwright.sync_api import (
     Playwright,
@@ -84,17 +89,31 @@ class BrowserManager:
         """Launch the browser, create a context & page, and apply anti-detection."""
         logger.info(
             "[浏览器] 启动中 (headless=%s, 浏览器路径=%s)",
-            self.headless, _PW_BROWSERS_PATH,
+            self.headless, describe_playwright_browsers_path(),
         )
         _tic()
         self._playwright = sync_playwright().start()
         _toc("Playwright 引擎启动")
 
         _tic()
-        self._browser = self._playwright.chromium.launch(
-            headless=self.headless,
-            args=LAUNCH_ARGS,
-        )
+        try:
+            self._browser = self._playwright.chromium.launch(
+                headless=self.headless,
+                args=LAUNCH_ARGS,
+            )
+        except Exception as exc:  # noqa: BLE001 - re-raised with guidance
+            message = str(exc)
+            if "Executable doesn't exist" in message:
+                raise DeepSeekError(
+                    "Chromium 未安装或路径无效。请任选一种方式修复：\n"
+                    "  1) 安装到 Playwright 默认目录:  python -m playwright install chromium\n"
+                    "  2) 安装到项目内目录:          "
+                    '$env:PLAYWRIGHT_BROWSERS_PATH="'
+                    f"{PROJECT_BROWSERS_PATH}"
+                    '"; python -m playwright install chromium\n'
+                    f"原始错误: {message}"
+                ) from exc
+            raise DeepSeekError(f"浏览器启动失败: {message}") from exc
         _toc("Chromium 浏览器启动")
 
         _tic()
