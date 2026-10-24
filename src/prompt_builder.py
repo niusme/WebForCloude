@@ -36,36 +36,68 @@ def _tools_to_text(tools: list) -> str:
     return "\n".join(lines)
 
 
+def _example_argument(ptype: str):
+    """Produce a plausible JSON value for a parameter type."""
+    if ptype in ("integer", "number"):
+        return 0
+    if ptype == "boolean":
+        return False
+    if ptype == "array":
+        return []
+    if ptype == "object":
+        return {}
+    return "..."
+
+
+def _build_tool_examples(tools: list) -> str:
+    """Build <tool_call> examples from the request's real tool names.
+
+    The examples must reuse the actual names: models copy them verbatim, and
+    a copied name like ``Read`` would not match a tool exposed as ``read``.
+    """
+    blocks = []
+    for tool in tools[:3]:
+        name = tool.get("name")
+        if not name:
+            continue
+        schema = tool.get("input_schema") or tool.get("parameters") or {}
+        props = schema.get("properties") or {}
+        args = {}
+        for pname, pinfo in list(props.items())[:2]:
+            ptype = (pinfo or {}).get("type", "string")
+            args[pname] = _example_argument(ptype)
+        blocks.append(
+            "<tool_call>\n"
+            + json.dumps({"name": name, "arguments": args}, ensure_ascii=False)
+            + "\n</tool_call>"
+        )
+    return "\n\n".join(blocks)
+
+
 _TOOL_SYSTEM_PROMPT = """\
 You have access to a set of tools you can use to accomplish tasks.
 
 Available tools:
 {tools_text}
 
-IMPORTANT: Tool calls MUST use <tool_call> tag with valid JSON inside. Examples:
+IMPORTANT: Tool calls MUST use a <tool_call> tag with valid JSON inside.
+The "name" value MUST be copied EXACTLY from the Available tools list above
+(same spelling, same letter case) — do not invent names and do not translate
+them.
 
-CORRECT ✅:
-<tool_call>
-{{"name": "Bash", "arguments": {{"command": "ls -la"}}}}
-</tool_call>
-
-CORRECT ✅:
-<tool_call>
-{{"name": "Read", "arguments": {{"file_path": "src/main.py"}}}}
-</tool_call>
-
-CORRECT ✅:
-<tool_call>
-{{"name": "Glob", "arguments": {{"pattern": "**/*.py"}}}}
-</tool_call>
+{examples}
 
 WRONG ❌: <Read>{{"file_path": "x"}}</Read>  ← wrong tag name
 WRONG ❌: <tool_call>Read {{"file_path": "x"}}</tool_call>  ← tool name outside JSON
 WRONG ❌: Read({{"file_path": "x"}})  ← no XML tag at all
-WRONG ❌: <tool_call>{{"name": "Read"}}</tool_call>  ← missing arguments
+WRONG ❌: <tool_call>{{"name": "some_tool"}}</tool_call>  ← missing arguments field
 
-After the tool runs, the result will appear between --- TOOL EXECUTED --- markers.
-Read it, analyze it, then respond to the user.
+Rules:
+- To use a tool, reply with ONLY the <tool_call> block(s), no prose around them.
+- Emit one <tool_call> block per tool call.
+- After the tool runs, the result appears between --- TOOL EXECUTED --- markers.
+  Read it, analyze it, then either answer the user or call another tool.
+- Never repeat the same tool call with the same arguments.
 
 Begin."""
 
@@ -106,7 +138,10 @@ def build_prompt(body: dict) -> str:
     # ── 2. tool definitions (if any) ──
     if tools:
         tools_text = _tools_to_text(tools)
-        tool_block = _TOOL_SYSTEM_PROMPT.format(tools_text=tools_text)
+        tool_block = _TOOL_SYSTEM_PROMPT.format(
+            tools_text=tools_text,
+            examples=_build_tool_examples(tools) or "(see the tool list above)",
+        )
         parts.append(f"[Tool Definitions]\n{tool_block}\n")
 
     # ── 3. conversation history (capped) ──
