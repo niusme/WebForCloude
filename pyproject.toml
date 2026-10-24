@@ -1,9 +1,14 @@
 [project]
 name = "webai"
 version = "0.1.0"
-description = "Add your description here"
+description = "DeepSeek Web Chat automation (Playwright) + Anthropic-compatible API server"
 requires-python = ">=3.12"
 dependencies = [
     "html2text>=2025.4.15",
     "playwright>=1.60.0",
+    # used by src/server.py (Anthropic-format API server)
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    # used by src/server.py and src/deepseek_api.py
+    "requests>=2.31",
 ]
