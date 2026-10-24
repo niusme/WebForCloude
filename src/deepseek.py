@@ -140,22 +140,98 @@ class DeepSeekClient:
 
     # ---- Authentication ----
 
-    def is_logged_in(self) -> bool:
-        """Check if the current session appears authenticated."""
+    #: localStorage key DeepSeek uses for the session token.
+    TOKEN_KEY = "userToken"
+
+    @staticmethod
+    def _token_from_raw(raw: Optional[str]) -> Optional[str]:
+        """Normalise a localStorage value into a non-empty token string."""
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return raw.strip() or None
+        if isinstance(parsed, dict):
+            value = parsed.get("value")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            return None
+        return str(parsed).strip() or None
+
+    def _read_user_token(self) -> Optional[str]:
+        """Return DeepSeek's auth token from localStorage, or None.
+
+        Checks ``userToken`` first, then falls back to any other localStorage
+        key that looks like a token — DeepSeek has renamed/added keys before.
+        """
+        if not self.page:
+            return None
+
+        try:
+            raw = self.page.evaluate(
+                "() => { try { return localStorage.getItem('userToken'); }"
+                " catch (e) { return null; } }"
+            )
+        except Exception as exc:
+            logger.debug("[认证] 读取 userToken 失败: %s", exc)
+            return None
+
+        token = self._token_from_raw(raw)
+        if token:
+            return token
+
+        # Fallback: any token-ish key other than the one we already checked.
+        try:
+            entries = self.page.evaluate(
+                "() => Object.entries(localStorage)"
+                ".filter(([k, v]) => /token/i.test(k) && v"
+                " && k !== 'userToken')"
+            )
+        except Exception:
+            return None
+
+        for key, value in entries or []:
+            token = self._token_from_raw(value)
+            if token:
+                logger.debug("[认证] 备用令牌键: %s", key)
+                return token
+        return None
+
+    def _page_closed(self) -> bool:
+        """True when the browser page/window is gone."""
+        try:
+            return self.page is None or self.page.is_closed()
+        except Exception:
+            return True
+
+    def _localstorage_keys(self) -> list:
+        """List localStorage keys (for diagnostics only)."""
+        try:
+            return list(self.page.evaluate("() => Object.keys(localStorage)") or [])
+        except Exception:
+            return []
+
+    def is_logged_in(self, strict: bool = False) -> bool:
+        """Check if the current session appears authenticated.
+
+        ``strict=True`` trusts only a real auth token in localStorage.  The
+        other heuristics (avatar / visible chat input) are also true on the
+        public logged-out page, which made ``--mode login`` believe the user
+        had already signed in and close the window immediately.
+        """
         if not self.page:
             return False
 
-        # Method 1: localStorage
+        # Method 1: localStorage token — the only reliable signal
         _tic()
-        try:
-            token = self.page.evaluate(
-                "() => localStorage.getItem('userToken')"
-            )
-            if token:
-                _toc("[认证] 检测 localStorage 令牌")
-                return True
-        except Exception:
-            pass
+        if self._read_user_token():
+            _toc("[认证] 检测到 localStorage 令牌")
+            return True
+
+        if strict:
+            logger.debug("[认证] strict 模式：未发现 userToken")
+            return False
 
         # Method 2: Avatar element
         try:
@@ -178,6 +254,7 @@ class DeepSeekClient:
         logger.debug("[认证] 未检测到登录状态")
         return False
 
+
     def login(self, timeout: Optional[int] = None) -> bool:
         """Open the browser and let the user log in manually."""
         if not self.page:
@@ -197,15 +274,27 @@ class DeepSeekClient:
         print()
         print("  Please log in manually in the browser window.")
         print("  Supported: WeChat scan / Google / Email etc.")
+        print("  提示：DeepSeek 允许游客匿名使用，页面可能直接显示聊天框；")
+        print("        请点击右上角 / 侧栏的「登录」完成账号登录。")
         print()
         print(f"  Timeout: {timeout_ms // 1000} seconds")
+        print("  The window stays open until a real login token is found.")
         print("  Session will be saved automatically after login.")
         print("=" * 60)
         print()
 
         _tic()
+        heartbeat_at = 0.0
         while time.monotonic() < deadline:
-            if self.is_logged_in():
+            if self._page_closed():
+                self._debug_screenshot("login_window_closed")
+                raise LoginError(
+                    "浏览器窗口已被关闭，登录未完成。请重新运行 --mode login。"
+                )
+
+            # Only a real auth token counts — the logged-out page also shows
+            # a chat box, so heuristics would end the wait too early.
+            if self.is_logged_in(strict=True):
                 _toc("[登录] 用户完成登录")
                 logger.info("检测到登录 — saving session.")
                 self._browser_mgr.save_session(self.session_path)
@@ -216,9 +305,32 @@ class DeepSeekClient:
                 print("=" * 60)
                 print()
                 return True
-            self.page.wait_for_timeout(1000)
+
+            now = time.monotonic()
+            if now - heartbeat_at >= 15:
+                heartbeat_at = now
+                try:
+                    url = self.page.url
+                except Exception:
+                    url = "?"
+                print(
+                    f"  [等待登录] 已等待 {int(now - (deadline - timeout_ms / 1000))}s"
+                    f" / {timeout_ms // 1000}s  当前页面: {url}"
+                )
+
+            try:
+                self.page.wait_for_timeout(1000)
+            except Exception as exc:
+                if self._page_closed():
+                    raise LoginError(
+                        "浏览器窗口已被关闭，登录未完成。请重新运行 --mode login。"
+                    ) from exc
+                logger.debug("[登录] 轮询失败: %s", exc)
 
         self._debug_screenshot("login_timeout")
+        keys = self._localstorage_keys()
+        if keys:
+            logger.warning("[登录] 超时未发现 userToken，localStorage 键: %s", keys)
         raise LoginError(
             f"Login timeout ({timeout_ms // 1000}s). "
             "Run --mode login again and complete the login."
