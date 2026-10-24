@@ -1,13 +1,18 @@
 """Direct DeepSeek API — PoW solved by hidden browser, chat via HTTP."""
-import json, logging, os, threading, time
+import json, logging, os, sys, threading, time
 from typing import Optional
 import requests
-from playwright.sync_api import sync_playwright
 
-os.environ.setdefault(
-    "PLAYWRIGHT_BROWSERS_PATH",
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "browsers")),
-)
+# ---- ensure project root is on sys.path (script may run standalone) ----
+_proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _proj_root not in sys.path:
+    sys.path.insert(0, _proj_root)
+
+from src.pw_env import apply_playwright_browsers_path
+
+apply_playwright_browsers_path()
+
+from playwright.sync_api import sync_playwright
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +32,11 @@ def _load_token() -> Optional[str]:
         for origin in data.get("origins", []):
             for item in origin.get("localStorage", []):
                 if item.get("name") == "userToken":
-                    raw = item["value"]
-                    return json.loads(raw).get("value") or raw
+                    raw = item.get("value", "")
+                    try:
+                        return json.loads(raw).get("value") or None
+                    except (TypeError, ValueError):
+                        return raw or None
     except Exception as exc:
         logger.warning("[令牌] 读取失败: %s", exc)
     return None
