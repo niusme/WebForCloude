@@ -147,6 +147,11 @@ def main() -> None:
 
     args = parser.parse_args()
     headless = not args.headed
+    if args.mode == "login":
+        # Manual login needs a visible window; force headed mode.
+        if headless:
+            print("Info: --mode login always runs with a visible browser window.")
+        headless = False
     client = DeepSeekClient(headless=headless)
 
     if args.mode == "login":
