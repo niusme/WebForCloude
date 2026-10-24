@@ -18,21 +18,92 @@ _FUNCTION_CALL_RE = re.compile(
     re.DOTALL,
 )
 
+# DeepSeek's native tool markup uses special tokens that arrive as text like
+#   <｜｜DSML｜｜ invoke name="read"> … </｜｜DSML｜｜ invoke>
+# (sometimes with ASCII pipes instead of the full-width bar).
+_DSML_MARKER_RE = re.compile(r"<(/?)[｜|]+\s*DSML\s*[｜|]+\s*")
+_INVOKE_BLOCK_RE = re.compile(
+    r'<invoke\s+name\s*=\s*"([^"]+)"\s*>(.*?)</invoke>', re.DOTALL
+)
+_PARAM_BLOCK_RE = re.compile(
+    r'<parameter\s+name\s*=\s*"([^"]+)"[^>]*>(.*?)</parameter>', re.DOTALL
+)
+
 _FIX_MAX_RETRIES = 3
+
+
+def _normalize_dsml(text: str) -> str:
+    """Rewrite DeepSeek's DSML / Anthropic-style invoke blocks as tool_calls.
+
+    DeepSeek emits ``<｜｜DSML｜｜ invoke name="read">`` with
+    ``<｜｜DSML｜｜ parameter name="file_path" string="true">`` children. After
+    stripping the special-token markers that is just the Anthropic
+    ``<invoke>``/``<parameter>`` shape, so convert it into the <tool_call>
+    JSON this module already understands.
+    """
+    if "DSML" not in text and "<invoke" not in text:
+        return text
+
+    text = _DSML_MARKER_RE.sub(lambda m: "<" + m.group(1), text)
+
+    if "<invoke" in text:
+        def _convert(match: re.Match) -> str:
+            name = match.group(1).strip()
+            args = {}
+            for pname, pvalue in _PARAM_BLOCK_RE.findall(match.group(2)):
+                args[pname.strip()] = pvalue.strip()
+            return "<tool_call>" + json.dumps(
+                {"name": name, "arguments": args}, ensure_ascii=False
+            ) + "</tool_call>"
+
+        text = _INVOKE_BLOCK_RE.sub(_convert, text)
+
+    # Drop the enclosing <calls> wrapper left behind by the conversion.
+    text = re.sub(r"</?calls\s*>", "", text)
+    return text
 
 
 # ── JSON parsing ──────────────────────────────────────────────────────────
 
 
 def _try_parse_json(raw: str) -> Optional[dict]:
-    """Strict JSON parse. Only accepts valid JSON directly, NO nested fallback."""
-    raw = raw.replace("\\", "/")
-    try:
-        tc = json.loads(raw)
-        if tc.get("name") and tc.get("arguments"):
-            return tc
-    except json.JSONDecodeError:
-        pass
+    """Parse a tool-call payload, repairing common model mistakes.
+
+    The raw text is tried verbatim first: blanket-replacing backslashes (the
+    old behaviour) corrupted Windows paths and escaped newlines. Only when
+    the JSON is invalid do we retry with backslashes normalised, which fixes
+    bare ``\p``-style escapes that models emit.
+    """
+    for candidate in (raw, raw.replace("\\", "/")):
+        try:
+            tc = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(tc, dict):
+            continue
+
+        name = tc.get("name") or tc.get("tool") or tc.get("tool_name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+
+        args = tc.get("arguments")
+        if args is None:
+            args = tc.get("parameters")
+        if args is None:
+            args = tc.get("input")
+        if args is None:
+            args = {}
+
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {"_raw": args}
+        if not isinstance(args, dict):
+            args = {"value": args}
+
+        return {"name": name.strip(), "arguments": args}
+
     return None
 
 
@@ -87,6 +158,8 @@ def _parse_response(text: str) -> tuple[str, list[dict]]:
     Returns (clean_text, tool_use_blocks).
     """
     text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL).strip()
+    # Rewrite DeepSeek's DSML / <invoke> markup into <tool_call> JSON first.
+    text = _normalize_dsml(text).strip()
     # Strip verbatim tool output blocks that DeepSeek sometimes regurgitates
     text = re.sub(
         r"--- TOOL EXECUTED ---.*?--- END TOOL OUTPUT ---",
@@ -106,13 +179,17 @@ def _parse_response(text: str) -> tuple[str, list[dict]]:
 
         if tc is None:
             full = match.group(0)
-            name_match = re.search(r'name\s*=\s*"(\w+)"', full)
-            params = dict(re.findall(
-                r'<parameter\s+name\s*=\s*"(\w+)"\s*>\s*"?([^"<\n]+)"?\s*</parameter>',
-                full,
-            ))
-            if name_match and params:
-                tc = {"name": name_match.group(1), "arguments": params}
+            name_match = re.search(r'name\s*=\s*"([^"]+)"', full)
+            # Tolerate extra attributes, e.g. <parameter name="x" string="true">
+            params = {
+                pname.strip(): pvalue.strip()
+                for pname, pvalue in _PARAM_BLOCK_RE.findall(full)
+            }
+            if name_match:
+                tc = {
+                    "name": name_match.group(1).strip(),
+                    "arguments": params,
+                }
 
         if tc is None:
             clean_parts.append(match.group(0))
